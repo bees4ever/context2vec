@@ -3,6 +3,7 @@
 Learns context2vec's parametric model
 """
 import argparse
+import pickle
 import time
 import sys
 
@@ -17,24 +18,10 @@ from chainer.optimizer_hooks import GradientClipping
 from sentence_reader import SentenceReaderDir
 from context2vec.common.context_models import BiLstmContext
 from context2vec.common.defs import IN_TO_OUT_UNITS_RATIO, NEGATIVE_SAMPLING_NUM
+from context2vec.train.corpus_by_sent_length import read_in_corpus
 
 
-#TODO: LOWER AS ARG
-def dump_embeddings(filename, w, units, index2word):
-    with open(filename, 'w') as f:
-        f.write('%d %d\n' % (len(index2word), units))
-        for i in range(w.shape[0]):
-            v = ' '.join(['%f' % v for v in w[i]])
-            f.write('%s %s\n' % (index2word[i], v))
-            
-def dump_comp_graph(filename, vs):
-    g = C.build_computational_graph(vs)
-    with open(filename, 'w') as o:
-        o.write(g.dump())
-        
-        
 def parse_arguments():
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--indir', '-i',
                         default=None,
@@ -72,16 +59,16 @@ def parse_arguments():
                         help='alpha param for Adam, controls the learning rate')
     parser.add_argument('--grad-clip', '-gc', default=None, type=float,
                         help='if specified, clip l2 of the gradient to this value')
-    
+
     args = parser.parse_args()
-    
+
     if args.deep == 'yes':
         args.deep = True
     elif args.deep == 'no':
         args.deep = False
     else:
         raise Exception("Invalid deep choice: " + args.deep)
-    
+
     print('GPU: {}'.format(args.gpu))
     print('# unit: {}'.format(args.unit))
     print('Minibatch-size: {}'.format(args.batchsize))
@@ -94,96 +81,160 @@ def parse_arguments():
     print('Alpha: {}'.format(args.alpha))
     print('Grad clip: {}'.format(args.grad_clip))
     print('')
-       
-    return args 
-    
+
+    return args
+
+#TODO: LOWER AS ARG
+from context2vec.train.sentence_reader import SentenceReaderDict
 
 
-args = parse_arguments()
 
-context_word_units = args.unit
-lstm_hidden_units = IN_TO_OUT_UNITS_RATIO*args.unit
-target_word_units = IN_TO_OUT_UNITS_RATIO*args.unit
 
-if args.gpu >= 0:
-    cuda.check_cuda_available()
-    cuda.get_device(args.gpu).use()
-xp = cuda.cupy if args.gpu >= 0 else np
-    
-reader = SentenceReaderDir(args.indir, args.trimfreq, args.batchsize)
-print('n_vocab: %d' % (len(reader.word2index)-3)) # excluding the three special tokens
-print('corpus size: %d' % (reader.total_words))
+class C2VWV:
+    def __init__(self, word2index: dict, vocabs: list, matrix):
+        self.matrix = matrix
+        self.word2index = word2index
+        self.vectors = matrix
+        self.vocabs = vocabs
 
-cs = [reader.trimmed_word2count[w] for w in range(len(reader.trimmed_word2count))]
-loss_func = L.NegativeSampling(target_word_units, cs, NEGATIVE_SAMPLING_NUM, args.ns_power)
+    def __getitem__(self, word):
+        return self.matrix[self.vocabs.index(word)]
 
-if args.context == 'lstm':
-    model = BiLstmContext(args.deep, args.gpu, reader.word2index, context_word_units, lstm_hidden_units, target_word_units, loss_func, True, args.dropout)
-else:
-    raise Exception('Unknown context type: {}'.format(args.context))
 
-optimizer = O.Adam(alpha=args.alpha)
-optimizer.setup(model)
+class Context2Vec:
+    def __init__(self):
+        self.backend_model = None
+        self.target_word_units = None
+        self.reader = None
 
-if args.grad_clip:
-    optimizer.add_hook(GradientClipping(args.grad_clip))
 
-STATUS_INTERVAL = 1000000
+    def __run(self, epoch, optimizer):
+        for epoch in range(epoch):
+            begin_time = time.time()
+            cur_at = begin_time
+            word_count = 0
+            STATUS_INTERVAL = 1000000
+            next_count = STATUS_INTERVAL
+            accum_loss = 0.0
+            last_accum_loss = 0.0
+            last_word_count = 0
+            print('epoch: {0}'.format(epoch))
 
-for epoch in range(args.epoch):
-    begin_time = time.time()
-    cur_at = begin_time
-    word_count = 0
-    next_count = STATUS_INTERVAL
-    accum_loss = 0.0
-    last_accum_loss = 0.0
-    last_word_count = 0
-    print('epoch: {0}'.format(epoch))
+            self.reader.open()
+            for sent in self.reader.next_batch():
 
-    reader.open()    
-    for sent in reader.next_batch():
+                self.backend_model.zerograds()
+                loss = self.backend_model(sent)
+                accum_loss += loss.data
+                loss.backward()
+                del loss
+                optimizer.update()
 
-        model.zerograds()
-        loss = model(sent)
-        accum_loss += loss.data
-        loss.backward()
-        del loss
-        optimizer.update()
+                word_count += len(sent) * len(sent[0])  # all sents in a batch are the same length
+                accum_mean_loss = float(accum_loss) / word_count if accum_loss > 0.0 else 0.0
 
-        word_count += len(sent)*len(sent[0]) # all sents in a batch are the same length
-        accum_mean_loss = float(accum_loss)/word_count if accum_loss > 0.0 else 0.0
+                if word_count >= next_count:
+                    now = time.time()
+                    duration = now - cur_at
+                    throuput = float((word_count - last_word_count)) / (now - cur_at)
+                    cur_mean_loss = (float(accum_loss) - last_accum_loss) / (word_count - last_word_count)
+                    print('{} words, {:.2f} sec, {:.2f} words/sec, {:.4f} accum_loss/word, {:.4f} cur_loss/word'.format(
+                        word_count, duration, throuput, accum_mean_loss, cur_mean_loss))
+                    next_count += STATUS_INTERVAL
+                    cur_at = now
+                    last_accum_loss = float(accum_loss)
+                    last_word_count = word_count
 
-        if word_count >= next_count:        
-            now = time.time()
-            duration = now - cur_at
-            throuput = float((word_count-last_word_count)) / (now - cur_at)
-            cur_mean_loss = (float(accum_loss)-last_accum_loss)/(word_count-last_word_count)
-            print('{} words, {:.2f} sec, {:.2f} words/sec, {:.4f} accum_loss/word, {:.4f} cur_loss/word'.format(
-                word_count, duration, throuput, accum_mean_loss, cur_mean_loss))
-            next_count += STATUS_INTERVAL
-            cur_at = now
-            last_accum_loss = float(accum_loss)
-            last_word_count = word_count
+            print('accum words per epoch', word_count, 'accum_loss', accum_loss, 'accum_loss/word', accum_mean_loss)
 
-    print('accum words per epoch', word_count, 'accum_loss', accum_loss, 'accum_loss/word', accum_mean_loss)
-    reader.close()
-    
-if args.wordsfile != None:        
-    dump_embeddings(args.wordsfile+'.targets', model.loss_func.W.data, target_word_units, reader.index2word)
+    def train(self, sentences, trimfreq=0, ns_power=0.75, dropout=0.0, cgfile=None, gpu=-1, unit=300, batchsize=100, epoch=10, deep=True, alpha=0.001, grad_clip=None):
+        print('GPU: {}'.format(gpu))
+        print('# unit: {}'.format(unit))
+        print('Minibatch-size: {}'.format(batchsize))
+        print('# epoch: {}'.format(epoch))
+        print('Deep: {}'.format(deep))
+        print('Dropout: {}'.format(dropout))
+        print('Trimfreq: {}'.format(trimfreq))
+        print('NS Power: {}'.format(ns_power))
+        print('Alpha: {}'.format(alpha))
+        print('Grad clip: {}'.format(grad_clip))
+        print('')
 
-if args.modelfile != None:
-    S.save_npz(args.modelfile, model)
-    
-with open(args.modelfile + '.params', 'w') as f:
-    f.write('model_file\t' + args.modelfile[args.modelfile.rfind('/')+1:]+'\n')
-    f.write('words_file\t' + args.wordsfile[args.wordsfile.rfind('/')+1:]+'.targets\n')
-    f.write('unit\t' + str(args.unit)+'\n')
-    if args.deep:
-        f.write('deep\tyes\n')
-    else:
-        f.write('deep\tno\n')
-    f.write('drop_ratio\t' + str(args.dropout)+'\n')    
-    f.write('#\t{}\n'.format(' '.join(sys.argv)))
-    
-    
+        context_word_units = unit
+        lstm_hidden_units = IN_TO_OUT_UNITS_RATIO * unit
+        self.target_word_units = IN_TO_OUT_UNITS_RATIO * unit
 
+        if gpu >= 0:
+            cuda.check_cuda_available()
+            cuda.get_device(gpu).use()
+        xp = cuda.cupy if gpu >= 0 else np
+
+        prepared_corpus = read_in_corpus(sentences)
+
+        self.reader = SentenceReaderDict(prepared_corpus, trimfreq, batchsize)
+        print('n_vocab: %d' % (len(self.reader.word2index) - 3))  # excluding the three special tokens
+        print('corpus size: %d' % (self.reader.total_words))
+
+        cs = [self.reader.trimmed_word2count[w] for w in range(len(self.reader.trimmed_word2count))]
+        loss_func = L.NegativeSampling(self.target_word_units, cs, NEGATIVE_SAMPLING_NUM, ns_power)
+
+        #args = parse_arguments()
+        self.backend_model = BiLstmContext(deep, gpu, self.reader.word2index, context_word_units, lstm_hidden_units, self.target_word_units, loss_func, True, dropout)
+
+        optimizer = O.Adam(alpha=alpha)
+        optimizer.setup(self.backend_model)
+
+        if grad_clip:
+            optimizer.add_hook(GradientClipping(grad_clip))
+
+
+        self.__run(epoch, optimizer)
+
+
+    @property
+    def wv(self):
+        return C2VWV(self.reader.word2index, list(c2v.reader.word2index.keys()), self.backend_model.loss_func.W.data)
+
+    def __get_bundle(self):
+        return {
+            'matrix': self.backend_model.loss_func.W.data,
+            'word_units': self.target_word_units,
+            'index2word': self.reader.index2word,
+            'word2index': self.reader.word2index,
+            'backend_model': self.backend_model,
+            'wv': self.wv
+        }
+
+
+    def save(self, path):
+        context2vec_bundle = self.__get_bundle()
+
+        with open(path, 'wb') as file:
+            pickle.dump(context2vec_bundle, file)
+
+corpus = [['till', 'this', 'moment', 'i', 'never', 'knew', 'myself', '.'],
+               ['seldom', ',', 'very', 'seldom', ',', 'does', 'complete', 'truth', 'belong', 'to', 'any', 'human',
+                'disclosure', ';', 'seldom', 'can', 'it', 'happen', 'that', 'something', 'is', 'not', 'a', 'little',
+                'disguised', 'or', 'a', 'little', 'mistaken', '.'],
+               ['i', 'declare', 'after', 'all', 'there', 'is', 'no', 'enjoyment', 'like', 'reading', '!', 'how', 'much',
+                'sooner', 'one', 'tires', 'of', 'anything', 'than', 'of', 'a', 'book', '!', '”'],
+               ['men', 'have', 'had', 'every', 'advantage', 'of', 'us', 'in', 'telling', 'their', 'own', 'story', '.',
+                'education', 'has', 'been', 'theirs', 'in', 'so', 'much', 'higher', 'a', 'degree'],
+               ['i', 'wish', ',', 'as', 'well', 'as', 'everybody', 'else', ',', 'to', 'be', 'perfectly', 'happy', ';',
+                'but', ',', 'like', 'everybody', 'else', ',', 'it', 'must', 'be', 'in', 'my', 'own', 'way', '.'],
+               ['there', 'are', 'people', ',', 'who', 'the', 'more', 'you', 'do', 'for', 'them', ',', 'the', 'less',
+                'they', 'will', 'do', 'for', 'themselves', '.'],
+               ['one', 'half', 'of', 'the', 'world', 'can', 'not', 'understand', 'the', 'pleasures', 'of', 'the',
+                'other', '.']]
+
+
+if __name__ == "__main__":
+    c2v = Context2Vec()
+    c2v.train(corpus, epoch=1)
+    # words_file = params['config_path'] + params['words_file']
+    #         model_file = params['config_path'] + params['model_file']
+    #         unit = int(params['unit'])
+    #         deep = (params['deep'] == 'yes')
+    #         drop_ratio = float(params['drop_ratio'])
+
+    # self.w, self.word2index, self.index2word, self.model = self.read_model(params)

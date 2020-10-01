@@ -22,6 +22,79 @@ def read_batch(f, batchsize, word2index):
         batch.append(sent_inds)
     return batch
 
+class SentenceReaderDict:
+    def __init__(self, prepared_corpus: dict, trimfreq, batchsize):
+        '''
+        Initialize reader.
+        :param path: input directory
+        :param trimfreq: treat all words with lower frequency than trimfreq as unknown words
+        :param batchsize: the size of the minibatch that will be read in every iteration
+        '''
+        self.prepared_corpus = prepared_corpus
+        self.batchsize = batchsize
+        self.trimmed_word2count, self.word2index, self.index2word = self.read_and_trim_vocab(trimfreq)
+        self.total_words = sum(self.trimmed_word2count.values())
+        self.fds = []
+
+
+    def open(self):
+        self.fds = []
+        for word_len, count in self.prepared_corpus['sent_counts'].items():
+            batches = int(math.ceil(float(count) / self.batchsize))
+            fd = self.prepared_corpus['batches'][word_len] # load the sentences for this current length
+            self.fds = self.fds + [fd] * batches
+        #np.random.seed(1034)
+        np.random.shuffle(self.fds)
+
+    def close(self):
+        pass
+
+    def read_and_trim_vocab(self, trimfreq):
+        trimmed_word2count = collections.Counter()
+        index2word = {Toks.UNK: '<UNK>', Toks.BOS: '<BOS>', Toks.EOS: '<EOS>'}
+        word2index = {'<UNK>': Toks.UNK, '<BOS>': Toks.BOS, '<EOS>': Toks.EOS}
+        unknown_counts = 0
+
+        for word, count in self.prepared_corpus['word_counts'].items():
+            if count >= trimfreq and word.lower() != '<unk>' and word.lower() != '<rw>':
+                ind = len(word2index)
+                word2index[word] = ind
+                index2word[ind] = word
+                trimmed_word2count[ind] = count
+            else:
+                unknown_counts += count
+        trimmed_word2count[word2index['<BOS>']] = 0
+        trimmed_word2count[word2index['<EOS>']] = 0
+        trimmed_word2count[word2index['<UNK>']] = unknown_counts
+
+        return trimmed_word2count, word2index, index2word
+
+    def next_batch(self):
+        for fd in self.fds:
+            batch = self.read_batch(fd, self.batchsize, self.word2index)
+            yield batch
+
+    def read_batch(self, sentences: list, batchsize, word2index):
+        batch = []
+        sentences_loader = iter(sentences)
+
+        while len(batch) < batchsize:
+            try:
+                sent_words = next(sentences_loader)
+                assert (len(sent_words) > 1)
+                sent_inds = []
+                for word in sent_words:
+                    if word in word2index:
+                        ind = word2index[word]
+                    else:
+                        ind = word2index['<UNK>']
+                    sent_inds.append(ind)
+                batch.append(sent_inds)
+
+            except StopIteration:
+                break
+
+        return batch
 
 class SentenceReaderDir(object):
     '''
