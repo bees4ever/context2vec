@@ -88,6 +88,16 @@ def parse_arguments():
 from context2vec.train.sentence_reader import SentenceReaderDict
 
 
+import numpy
+
+
+def cosine(a, b):
+    norm1 = numpy.linalg.norm(a)
+    norm2 = numpy.linalg.norm(b)
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0
+    else:
+        return a.dot(b) / (norm1 * norm2)
 
 
 class C2VWV:
@@ -231,6 +241,7 @@ corpus = [['till', 'this', 'moment', 'i', 'never', 'knew', 'myself', '.'],
 if __name__ == "__main__":
     c2v = Context2Vec()
     c2v.train(corpus, epoch=1)
+    print(c2v.wv['of'])
     # words_file = params['config_path'] + params['words_file']
     #         model_file = params['config_path'] + params['model_file']
     #         unit = int(params['unit'])
@@ -238,3 +249,14 @@ if __name__ == "__main__":
     #         drop_ratio = float(params['drop_ratio'])
 
     # self.w, self.word2index, self.index2word, self.model = self.read_model(params)
+
+    a2 = c2v.backend_model.context2vec(['a', 'man', 'and', 'a', 'woman'], 3)
+    a1 = c2v.backend_model.context2vec(['a', 'man', 'and', 'a', 'woman'], 0)
+
+    print(cosine(a1, a1), cosine(a1, a2))
+
+    of_context = c2v.backend_model.context2vec(['a', 'man', 'of', 'a', 'woman'], 2)
+    of_context_2 = c2v.backend_model.context2vec(['a', 'part', 'of', 'the', 'world'], 2)
+    cosine(c2v.wv['of'], of_context)
+    cosine(c2v.wv['of'], of_context_2)
+
